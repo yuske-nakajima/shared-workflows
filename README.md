@@ -36,17 +36,18 @@ permissions:
 jobs:
   dep-check:
     uses: yuske-nakajima/shared-workflows/.github/workflows/dep-check.yml@v1
-    secrets: inherit
 ```
 
 トリガー（`schedule` / `workflow_dispatch`）は呼び出し側で定義する。再利用ワークフロー側はトリガーを持たない。
+
+このワークフローは secrets を参照しないため `secrets: inherit` は不要。caller の全シークレットを渡す露出を避けるため指定しない。
 
 #### 前提条件（呼び出し側リポジトリ）
 
 1. `.mise.toml` に `node` と `"npm:pnpm"` のバージョン定義がある（`jdx/mise-action@v2` が解決）
 2. pnpm プロジェクトで、`package.json` に `packageManager`（`pnpm@x.y.z`）と `engines.pnpm` がある
 3. lockfile（`pnpm-lock.yaml`）がコミットされている（`--frozen-lockfile` のため）
-4. caller ワークフローに `permissions: issues: write` と `secrets: inherit` を設定する
+4. caller ワークフローに `permissions: issues: write` を設定する（secrets は参照しないため `secrets: inherit` は不要）
 5. `dependencies` ラベルを Issue 用に使用（色分けしたいなら事前にラベル作成）
 
 `permissions` は再利用ワークフロー側でも宣言しているが、実効権限は caller の `GITHUB_TOKEN` 権限で上限が決まる。caller 側にも `issues: write` が必要。

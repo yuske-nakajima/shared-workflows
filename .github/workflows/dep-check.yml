@@ -7,12 +7,20 @@ permissions:
   contents: read
   issues: write
 
+# 同一リポジトリでの同時実行を直列化し、Issue の二重作成/二重クローズを防ぐ。
+# github.repository は呼び出し元リポジトリに解決される。
+concurrency:
+  group: dep-check-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   dep-check:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: jdx/mise-action@v2
 
@@ -24,25 +32,36 @@ jobs:
         run: |
           NODE_MAJOR=$(node -v | sed 's/v\([0-9]*\).*/\1/')
           NODE_CURRENT=$(node -v | sed 's/v//')
-          EOL_DATA=$(curl -sf "https://endoflife.date/api/nodejs/${NODE_MAJOR}.json")
-          EOL_DATE=$(echo "$EOL_DATA" | jq -r '.eol')
-          LATEST=$(echo "$EOL_DATA" | jq -r '.latest')
-          LTS=$(echo "$EOL_DATA" | jq -r '.lts')
 
-          # EOL まで 90 日以内かチェック
-          TODAY=$(date +%s)
-          EOL_TS=$(date -d "$EOL_DATE" +%s 2>/dev/null || date -j -f "%Y-%m-%d" "$EOL_DATE" +%s 2>/dev/null || echo "0")
-          DAYS_LEFT=$(( (EOL_TS - TODAY) / 86400 ))
+          # endoflife.date は一時障害/レート制限で落ちうるため retry し、最終的に失敗したら
+          # EOL 判定をスキップしてワークフロー全体は継続する
+          EOL_DATA=""
+          for _ in 1 2 3; do
+            EOL_DATA=$(curl -sf --max-time 10 "https://endoflife.date/api/nodejs/${NODE_MAJOR}.json") && break
+            sleep 2
+          done
 
           REPORT=""
-          if [ "$DAYS_LEFT" -lt 90 ] && [ "$DAYS_LEFT" -gt 0 ]; then
-            REPORT="⚠️ Node.js ${NODE_MAJOR} の EOL まで残り ${DAYS_LEFT} 日 (${EOL_DATE})"
-          elif [ "$DAYS_LEFT" -le 0 ]; then
-            REPORT="🚨 Node.js ${NODE_MAJOR} は EOL を過ぎています (${EOL_DATE})"
-          fi
+          if [ -z "$EOL_DATA" ]; then
+            REPORT="⚠️ Node.js の EOL 情報取得に失敗 (endoflife.date)。EOL 判定をスキップしました"
+          else
+            EOL_DATE=$(echo "$EOL_DATA" | jq -r '.eol')
+            LATEST=$(echo "$EOL_DATA" | jq -r '.latest')
 
-          if [ "$NODE_CURRENT" != "$LATEST" ]; then
-            REPORT="${REPORT}\n📦 Node.js アップデート: v${NODE_CURRENT} → v${LATEST}"
+            # EOL まで 90 日以内かチェック
+            TODAY=$(date +%s)
+            EOL_TS=$(date -d "$EOL_DATE" +%s 2>/dev/null || date -j -f "%Y-%m-%d" "$EOL_DATE" +%s 2>/dev/null || echo "0")
+            DAYS_LEFT=$(( (EOL_TS - TODAY) / 86400 ))
+
+            if [ "$DAYS_LEFT" -lt 90 ] && [ "$DAYS_LEFT" -gt 0 ]; then
+              REPORT="⚠️ Node.js ${NODE_MAJOR} の EOL まで残り ${DAYS_LEFT} 日 (${EOL_DATE})"
+            elif [ "$DAYS_LEFT" -le 0 ]; then
+              REPORT="🚨 Node.js ${NODE_MAJOR} は EOL を過ぎています (${EOL_DATE})"
+            fi
+
+            if [ "$NODE_CURRENT" != "$LATEST" ]; then
+              REPORT="${REPORT}\n📦 Node.js アップデート: v${NODE_CURRENT} → v${LATEST}"
+            fi
           fi
 
           # .mise.toml のバージョンと実際のバージョンを比較
@@ -63,7 +82,8 @@ jobs:
         run: |
           LATEST_PNPM=$(npm view pnpm version)
           ACTUAL_PNPM=$(pnpm -v)
-          MISE_PNPM=$(grep '^pnpm' .mise.toml | sed 's/.*"\(.*\)".*/\1/')
+          # .mise.toml の pnpm は npm backend (`"npm:pnpm" = "x.y.z"`) と素の `pnpm = "x.y.z"` の両形式がありうる
+          MISE_PNPM=$(grep -E '^("npm:pnpm"|pnpm)' .mise.toml | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/')
           PKG_MANAGER=$(jq -r '.packageManager // ""' package.json | sed 's/^pnpm@//' | sed 's/+.*//')
           ENGINES_PNPM=$(jq -r '.engines.pnpm // ""' package.json)
 
@@ -215,12 +235,13 @@ jobs:
             const hash = (s) => crypto.createHash('sha256').update(s).digest('hex');
             const newHash = hash(normalize(body));
 
-            // 既存の依存性レポート Issue を取得
-            const { data: existingIssues } = await github.rest.issues.listForRepo({
+            // 既存の依存性レポート Issue を取得（paginate で 30 件超のリポジトリも取りこぼさない）
+            const existingIssues = await github.paginate(github.rest.issues.listForRepo, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               state: 'open',
               labels: 'dependencies',
+              per_page: 100,
             });
             const reportIssues = existingIssues.filter(i =>
               i.title.startsWith('📦 依存性チェックレポート')

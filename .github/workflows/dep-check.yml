@@ -1,0 +1,255 @@
+name: Dependency Check
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  dep-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v2
+
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+
+      # Node.js EOL チェック
+      - name: Check Node.js EOL
+        id: node-eol
+        run: |
+          NODE_MAJOR=$(node -v | sed 's/v\([0-9]*\).*/\1/')
+          NODE_CURRENT=$(node -v | sed 's/v//')
+          EOL_DATA=$(curl -sf "https://endoflife.date/api/nodejs/${NODE_MAJOR}.json")
+          EOL_DATE=$(echo "$EOL_DATA" | jq -r '.eol')
+          LATEST=$(echo "$EOL_DATA" | jq -r '.latest')
+          LTS=$(echo "$EOL_DATA" | jq -r '.lts')
+
+          # EOL まで 90 日以内かチェック
+          TODAY=$(date +%s)
+          EOL_TS=$(date -d "$EOL_DATE" +%s 2>/dev/null || date -j -f "%Y-%m-%d" "$EOL_DATE" +%s 2>/dev/null || echo "0")
+          DAYS_LEFT=$(( (EOL_TS - TODAY) / 86400 ))
+
+          REPORT=""
+          if [ "$DAYS_LEFT" -lt 90 ] && [ "$DAYS_LEFT" -gt 0 ]; then
+            REPORT="⚠️ Node.js ${NODE_MAJOR} の EOL まで残り ${DAYS_LEFT} 日 (${EOL_DATE})"
+          elif [ "$DAYS_LEFT" -le 0 ]; then
+            REPORT="🚨 Node.js ${NODE_MAJOR} は EOL を過ぎています (${EOL_DATE})"
+          fi
+
+          if [ "$NODE_CURRENT" != "$LATEST" ]; then
+            REPORT="${REPORT}\n📦 Node.js アップデート: v${NODE_CURRENT} → v${LATEST}"
+          fi
+
+          # .mise.toml のバージョンと実際のバージョンを比較
+          MISE_NODE=$(grep '^node' .mise.toml | sed 's/.*"\(.*\)".*/\1/')
+          ACTUAL_NODE=$(node -v | sed 's/v//')
+          if [ "$MISE_NODE" != "$ACTUAL_NODE" ]; then
+            REPORT="${REPORT}\n⚠️ Node.js バージョン不一致: mise.toml=${MISE_NODE}, 実際=${ACTUAL_NODE}"
+          fi
+
+          echo "report<<EOF" >> "$GITHUB_OUTPUT"
+          echo -e "$REPORT" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -v)" >> "$GITHUB_OUTPUT"
+
+      # pnpm バージョンチェック
+      - name: Check pnpm version
+        id: pnpm-check
+        run: |
+          LATEST_PNPM=$(npm view pnpm version)
+          ACTUAL_PNPM=$(pnpm -v)
+          MISE_PNPM=$(grep '^pnpm' .mise.toml | sed 's/.*"\(.*\)".*/\1/')
+          PKG_MANAGER=$(jq -r '.packageManager // ""' package.json | sed 's/^pnpm@//' | sed 's/+.*//')
+          ENGINES_PNPM=$(jq -r '.engines.pnpm // ""' package.json)
+
+          REPORT=""
+          # 全箇所 (実体, .mise.toml, packageManager, engines.pnpm) が一致しているか
+          for PAIR in "mise.toml=${MISE_PNPM}" "packageManager=${PKG_MANAGER}" "engines.pnpm=${ENGINES_PNPM}"; do
+            NAME="${PAIR%%=*}"
+            VAL="${PAIR#*=}"
+            if [ -n "$VAL" ] && [ "$VAL" != "$ACTUAL_PNPM" ]; then
+              REPORT="${REPORT}\n⚠️ pnpm バージョン不一致: ${NAME}=${VAL}, 実際=${ACTUAL_PNPM}"
+            fi
+          done
+
+          if [ "$ACTUAL_PNPM" != "$LATEST_PNPM" ]; then
+            REPORT="${REPORT}\n📦 pnpm アップデート: v${ACTUAL_PNPM} → v${LATEST_PNPM}"
+          fi
+
+          echo "report<<EOF" >> "$GITHUB_OUTPUT"
+          echo -e "$REPORT" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "version=$ACTUAL_PNPM" >> "$GITHUB_OUTPUT"
+
+      # npm-check-updates でアップデートチェック
+      # 出力が巨大になり環境変数では ARG_MAX を超えるため、ファイル経由で受け渡す
+      # --cooldown 7d: 公開から 7 日未満のバージョンを除外（サプライチェーン対策）。
+      # latest はフォールバックで cooldown を満たす最大版を提案する。
+      - name: Check patch updates
+        run: npx -y npm-check-updates --target patch --cooldown 7d > "$RUNNER_TEMP/patch.txt" 2>/dev/null || true
+
+      - name: Check minor updates
+        run: npx -y npm-check-updates --target minor --cooldown 7d > "$RUNNER_TEMP/minor.txt" 2>/dev/null || true
+
+      - name: Check major updates
+        run: npx -y npm-check-updates --target latest --cooldown 7d > "$RUNNER_TEMP/major.txt" 2>/dev/null || true
+
+      # pnpm audit
+      - name: Check vulnerabilities
+        run: pnpm audit --prod > "$RUNNER_TEMP/audit.txt" 2>&1 || true
+
+      # レポート生成 & Issue 作成
+      - name: Create issue if updates found
+        uses: actions/github-script@v7
+        env:
+          NODE_EOL: ${{ steps.node-eol.outputs.report }}
+          PNPM_REPORT: ${{ steps.pnpm-check.outputs.report }}
+          NODE_VERSION: ${{ steps.node-eol.outputs.version }}
+          PNPM_VERSION: ${{ steps.pnpm-check.outputs.version }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+            const readReport = (name) => {
+              const p = path.join(process.env.RUNNER_TEMP, name);
+              return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '';
+            };
+            const nodeEol = process.env.NODE_EOL?.trim() || '';
+            const pnpmReport = process.env.PNPM_REPORT?.trim() || '';
+            const patch = readReport('patch.txt');
+            const minor = readReport('minor.txt');
+            const major = readReport('major.txt');
+            const audit = readReport('audit.txt');
+
+            // ncu 出力からパッケージ名を抽出する
+            const parsePackageNames = (ncuOutput) => {
+              const names = new Set();
+              for (const line of ncuOutput.split('\n')) {
+                // " eslint  10.1.0  →  10.2.0" のような行を検出
+                const match = line.match(/^\s+(\S+)\s+\S+\s+→\s+\S+/);
+                if (match) names.add(match[1]);
+              }
+              return names;
+            };
+
+            // ncu 出力から指定パッケージの行を除外する
+            const filterOutput = (ncuOutput, excludeNames) => {
+              if (excludeNames.size === 0) return ncuOutput;
+              const lines = ncuOutput.split('\n');
+              const filtered = lines.filter(line => {
+                const match = line.match(/^\s+(\S+)\s+\S+\s+→\s+\S+/);
+                return !match || !excludeNames.has(match[1]);
+              });
+              // フィルタ後にパッケージ行が残っていなければ「全て最新」メッセージに置換
+              const hasPackages = filtered.some(l => l.match(/^\s+\S+\s+\S+\s+→\s+\S+/));
+              if (!hasPackages) {
+                return 'All dependencies match the latest package versions :)';
+              }
+              // "Run npx ..." 行も除外（パッケージがない場合は不要）
+              return filtered.filter(l => !l.trimStart().startsWith('Run npx')).join('\n');
+            };
+
+            const patchPkgs = parsePackageNames(patch);
+            const minorPkgs = parsePackageNames(minor);
+
+            // マイナーからパッチ重複を除外、メジャーからパッチ+マイナー重複を除外
+            const filteredMinor = filterOutput(minor, patchPkgs);
+            const filteredMajor = filterOutput(major, new Set([...patchPkgs, ...minorPkgs]));
+
+            // ncu の「全て最新」メッセージ判定
+            // cooldown 等でメッセージ中に文言が差し込まれる場合があるため
+            // "All dependencies" と "match...package versions" の間を緩く許容して判定する
+            const isAllLatest = (r) => /All dependencies[^\n]*match[^\n]*package versions/.test(r);
+            const allLatest = [patch, filteredMinor, filteredMajor].every(isAllLatest);
+            const noVulnerabilities = audit.includes('found 0 vulnerabilities') || audit.includes('No known vulnerabilities found');
+            const noNodeIssue = nodeEol === '';
+            const noPnpmIssue = pnpmReport === '';
+
+            if (allLatest && noVulnerabilities && noNodeIssue && noPnpmIssue) {
+              console.log('全て最新・問題なし。Issue は作成しません。');
+              return;
+            }
+
+            const today = new Date().toISOString().split('T')[0];
+            const title = `📦 依存性チェックレポート (${today})`;
+
+            let body = `# 依存性チェックレポート\n\n`;
+            body += `**実行日**: ${today}\n`;
+            body += `**Node.js**: ${process.env.NODE_VERSION}\n`;
+            body += `**pnpm**: v${process.env.PNPM_VERSION}\n\n`;
+
+            if (nodeEol) {
+              body += `## Node.js ステータス\n\n${nodeEol}\n\n`;
+            }
+
+            if (pnpmReport) {
+              body += `## pnpm ステータス\n\n${pnpmReport}\n\n`;
+            }
+
+            // GitHub Issue 本文の上限は 65536 文字。各セクション個別に切り詰めて収める。
+            const truncate = (s, max) => {
+              if (s.length <= max) return s;
+              return s.slice(0, max) + `\n...(省略: ${s.length - max} 文字)`;
+            };
+            body += `## パッチアップデート\n\n\`\`\`\n${truncate(patch, 10000)}\n\`\`\`\n\n`;
+            body += `## マイナーアップデート\n\n\`\`\`\n${truncate(filteredMinor, 10000)}\n\`\`\`\n\n`;
+            body += `## メジャーアップデート\n\n\`\`\`\n${truncate(filteredMajor, 10000)}\n\`\`\`\n\n`;
+            body += `## セキュリティ監査\n\n\`\`\`\n${truncate(audit, 20000)}\n\`\`\`\n\n`;
+            body += `---\n🤖 GitHub Actions により自動生成`;
+
+            // 最終セーフガード: 念のため全体を 65000 文字に切る
+            if (body.length > 65000) {
+              body = body.slice(0, 65000) + '\n\n...(本文が上限を超えたため切り詰め)';
+            }
+
+            // body から日付に依存する行を除去して比較用に正規化
+            const normalize = (s) => s
+              .replace(/\*\*実行日\*\*:.*\n/, '')
+              .replace(/^📦 依存性チェックレポート \(\d{4}-\d{2}-\d{2}\)/, '');
+            const crypto = require('node:crypto');
+            const hash = (s) => crypto.createHash('sha256').update(s).digest('hex');
+            const newHash = hash(normalize(body));
+
+            // 既存の依存性レポート Issue を取得
+            const { data: existingIssues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'dependencies',
+            });
+            const reportIssues = existingIssues.filter(i =>
+              i.title.startsWith('📦 依存性チェックレポート')
+            );
+
+            // 最新 Issue と内容が一致するならスキップ
+            const latest = reportIssues.sort((a, b) =>
+              new Date(b.created_at) - new Date(a.created_at)
+            )[0];
+            if (latest && hash(normalize(latest.body || '')) === newHash) {
+              console.log('既存 Issue と内容が一致。作成をスキップします。');
+              return;
+            }
+
+            // 既存レポート Issue をクローズ
+            for (const issue of reportIssues) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'not_planned',
+              });
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['dependencies'],
+            });

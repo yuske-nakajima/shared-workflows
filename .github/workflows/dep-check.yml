@@ -24,11 +24,53 @@ jobs:
 
       - uses: jdx/mise-action@v2
 
-      - run: pnpm install --frozen-lockfile --ignore-scripts
+      # lockfile から PM を検出する。優先順位 pnpm → yarn → bun → npm。
+      # package-lock.json は他 PM 併用時にも生成されがちなので最後に回す。
+      # 1 つも無ければ pm=none を出力し、後続の依存チェック step を全てスキップする。
+      - name: Detect package manager
+        id: detect
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            PM=pnpm
+          elif [ -f yarn.lock ]; then
+            PM=yarn
+          elif [ -f bun.lockb ] || [ -f bun.lock ]; then
+            PM=bun
+          elif [ -f package-lock.json ]; then
+            PM=npm
+          else
+            PM=none
+          fi
+          echo "pm=$PM" >> "$GITHUB_OUTPUT"
+          echo "検出した PM: $PM"
+
+      # install は lockfile 整合確認が目的のため失敗を可視化する（|| true で握らない）。
+      # 依存の postinstall を実行しない（サプライチェーン対策）。yarn berry は
+      # --ignore-scripts フラグが無いため YARN_ENABLE_SCRIPTS=false で代替する。
+      # yarn は classic(v1) に --immutable が無く berry(v2+) に --frozen-lockfile が無いため
+      # yarn -v の major で分岐する。
+      - name: Install dependencies
+        if: steps.detect.outputs.pm != 'none'
+        env:
+          PM: ${{ steps.detect.outputs.pm }}
+        run: |
+          case "$PM" in
+            npm)  npm ci --ignore-scripts ;;
+            pnpm) pnpm install --frozen-lockfile --ignore-scripts ;;
+            bun)  bun install --frozen-lockfile --ignore-scripts ;;
+            yarn)
+              if [ "$(yarn -v | cut -d. -f1)" -ge 2 ]; then
+                YARN_ENABLE_SCRIPTS=false yarn install --immutable
+              else
+                yarn install --frozen-lockfile --ignore-scripts
+              fi
+              ;;
+          esac
 
       # Node.js EOL チェック
       - name: Check Node.js EOL
         id: node-eol
+        if: steps.detect.outputs.pm != 'none'
         run: |
           NODE_MAJOR=$(node -v | sed 's/v\([0-9]*\).*/\1/')
           NODE_CURRENT=$(node -v | sed 's/v//')
@@ -76,61 +118,81 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
           echo "version=$(node -v)" >> "$GITHUB_OUTPUT"
 
-      # pnpm バージョンチェック
-      - name: Check pnpm version
-        id: pnpm-check
+      # PM バージョンチェック。npm レジストリの最新版と実体を比較するのみ。
+      # npm view は npm/pnpm/bun と yarn classic(v1) はレジストリの該当系列を返す。
+      # yarn berry(v2+) は npm の yarn が classic 系列(1.x)を返し誤ったダウングレード提案に
+      # なるため比較対象から除外する（実体バージョンは Issue 本文用に出力する）。
+      # LATEST が空（レジストリ一時障害 / berry 除外）なら比較しない。
+      - name: Check package manager version
+        id: pm-check
+        if: steps.detect.outputs.pm != 'none'
+        env:
+          PM: ${{ steps.detect.outputs.pm }}
         run: |
-          LATEST_PNPM=$(npm view pnpm version)
-          ACTUAL_PNPM=$(pnpm -v)
-          # .mise.toml の pnpm は npm backend (`"npm:pnpm" = "x.y.z"`) と素の `pnpm = "x.y.z"` の両形式がありうる
-          MISE_PNPM=$(grep -E '^("npm:pnpm"|pnpm)' .mise.toml | sed 's/.*=[[:space:]]*"\(.*\)".*/\1/')
-          PKG_MANAGER=$(jq -r '.packageManager // ""' package.json | sed 's/^pnpm@//' | sed 's/+.*//')
-          ENGINES_PNPM=$(jq -r '.engines.pnpm // ""' package.json)
-
+          ACTUAL=$("$PM" -v)
+          LATEST=""
+          if [ "$PM" = yarn ] && [ "$(echo "$ACTUAL" | cut -d. -f1)" -ge 2 ]; then
+            :
+          else
+            LATEST=$(npm view "$PM" version)
+          fi
           REPORT=""
-          # 全箇所 (実体, .mise.toml, packageManager, engines.pnpm) が一致しているか
-          for PAIR in "mise.toml=${MISE_PNPM}" "packageManager=${PKG_MANAGER}" "engines.pnpm=${ENGINES_PNPM}"; do
-            NAME="${PAIR%%=*}"
-            VAL="${PAIR#*=}"
-            if [ -n "$VAL" ] && [ "$VAL" != "$ACTUAL_PNPM" ]; then
-              REPORT="${REPORT}\n⚠️ pnpm バージョン不一致: ${NAME}=${VAL}, 実際=${ACTUAL_PNPM}"
-            fi
-          done
-
-          if [ "$ACTUAL_PNPM" != "$LATEST_PNPM" ]; then
-            REPORT="${REPORT}\n📦 pnpm アップデート: v${ACTUAL_PNPM} → v${LATEST_PNPM}"
+          if [ -n "$LATEST" ] && [ "$ACTUAL" != "$LATEST" ]; then
+            REPORT="📦 ${PM} アップデート: v${ACTUAL} → v${LATEST}"
           fi
 
           echo "report<<EOF" >> "$GITHUB_OUTPUT"
           echo -e "$REPORT" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
-          echo "version=$ACTUAL_PNPM" >> "$GITHUB_OUTPUT"
+          echo "version=$ACTUAL" >> "$GITHUB_OUTPUT"
+          echo "name=$PM" >> "$GITHUB_OUTPUT"
 
       # npm-check-updates でアップデートチェック
       # 出力が巨大になり環境変数では ARG_MAX を超えるため、ファイル経由で受け渡す
       # --cooldown 7d: 公開から 7 日未満のバージョンを除外（サプライチェーン対策）。
       # latest はフォールバックで cooldown を満たす最大版を提案する。
       - name: Check patch updates
+        if: steps.detect.outputs.pm != 'none'
         run: npx -y npm-check-updates --target patch --cooldown 7d > "$RUNNER_TEMP/patch.txt" 2>/dev/null || true
 
       - name: Check minor updates
+        if: steps.detect.outputs.pm != 'none'
         run: npx -y npm-check-updates --target minor --cooldown 7d > "$RUNNER_TEMP/minor.txt" 2>/dev/null || true
 
       - name: Check major updates
+        if: steps.detect.outputs.pm != 'none'
         run: npx -y npm-check-updates --target latest --cooldown 7d > "$RUNNER_TEMP/major.txt" 2>/dev/null || true
 
-      # pnpm audit
+      # audit。各 PM とも || true で握り結果を audit.txt へ出力する（失敗してもワークフロー継続）。
+      # yarn は classic に yarn audit、berry(v2+) に yarn npm audit --all --recursive。
       - name: Check vulnerabilities
-        run: pnpm audit --prod > "$RUNNER_TEMP/audit.txt" 2>&1 || true
+        if: steps.detect.outputs.pm != 'none'
+        env:
+          PM: ${{ steps.detect.outputs.pm }}
+        run: |
+          case "$PM" in
+            npm)  npm audit > "$RUNNER_TEMP/audit.txt" 2>&1 || true ;;
+            pnpm) pnpm audit --prod > "$RUNNER_TEMP/audit.txt" 2>&1 || true ;;
+            bun)  bun audit > "$RUNNER_TEMP/audit.txt" 2>&1 || true ;;
+            yarn)
+              if [ "$(yarn -v | cut -d. -f1)" -ge 2 ]; then
+                yarn npm audit --all --recursive > "$RUNNER_TEMP/audit.txt" 2>&1 || true
+              else
+                yarn audit > "$RUNNER_TEMP/audit.txt" 2>&1 || true
+              fi
+              ;;
+          esac
 
       # レポート生成 & Issue 作成
       - name: Create issue if updates found
+        if: steps.detect.outputs.pm != 'none'
         uses: actions/github-script@v7
         env:
           NODE_EOL: ${{ steps.node-eol.outputs.report }}
-          PNPM_REPORT: ${{ steps.pnpm-check.outputs.report }}
+          PM_REPORT: ${{ steps.pm-check.outputs.report }}
           NODE_VERSION: ${{ steps.node-eol.outputs.version }}
-          PNPM_VERSION: ${{ steps.pnpm-check.outputs.version }}
+          PM_VERSION: ${{ steps.pm-check.outputs.version }}
+          PM_NAME: ${{ steps.pm-check.outputs.name }}
         with:
           script: |
             const fs = require('node:fs');
@@ -140,7 +202,8 @@ jobs:
               return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '';
             };
             const nodeEol = process.env.NODE_EOL?.trim() || '';
-            const pnpmReport = process.env.PNPM_REPORT?.trim() || '';
+            const pmReport = process.env.PM_REPORT?.trim() || '';
+            const pmName = process.env.PM_NAME || '';
             const patch = readReport('patch.txt');
             const minor = readReport('minor.txt');
             const major = readReport('major.txt');
@@ -186,11 +249,20 @@ jobs:
             // "All dependencies" と "match...package versions" の間を緩く許容して判定する
             const isAllLatest = (r) => /All dependencies[^\n]*match[^\n]*package versions/.test(r);
             const allLatest = [patch, filteredMinor, filteredMajor].every(isAllLatest);
-            const noVulnerabilities = audit.includes('found 0 vulnerabilities') || audit.includes('No known vulnerabilities found');
+            // 「脆弱性なし」判定文言は PM ごとに異なる:
+            // npm=found 0 vulnerabilities / pnpm=No known vulnerabilities found /
+            // yarn classic=0 vulnerabilities found / yarn berry=No audit suggestions /
+            // bun=No vulnerabilities found
+            const noVulnerabilities =
+              audit.includes('found 0 vulnerabilities') ||
+              audit.includes('No known vulnerabilities found') ||
+              audit.includes('0 vulnerabilities found') ||
+              audit.includes('No audit suggestions') ||
+              audit.includes('No vulnerabilities found');
             const noNodeIssue = nodeEol === '';
-            const noPnpmIssue = pnpmReport === '';
+            const noPmIssue = pmReport === '';
 
-            if (allLatest && noVulnerabilities && noNodeIssue && noPnpmIssue) {
+            if (allLatest && noVulnerabilities && noNodeIssue && noPmIssue) {
               console.log('全て最新・問題なし。Issue は作成しません。');
               return;
             }
@@ -201,14 +273,14 @@ jobs:
             let body = `# 依存性チェックレポート\n\n`;
             body += `**実行日**: ${today}\n`;
             body += `**Node.js**: ${process.env.NODE_VERSION}\n`;
-            body += `**pnpm**: v${process.env.PNPM_VERSION}\n\n`;
+            body += `**${pmName}**: v${process.env.PM_VERSION}\n\n`;
 
             if (nodeEol) {
               body += `## Node.js ステータス\n\n${nodeEol}\n\n`;
             }
 
-            if (pnpmReport) {
-              body += `## pnpm ステータス\n\n${pnpmReport}\n\n`;
+            if (pmReport) {
+              body += `## ${pmName} ステータス\n\n${pmReport}\n\n`;
             }
 
             // GitHub Issue 本文の上限は 65536 文字。各セクション個別に切り詰めて収める。

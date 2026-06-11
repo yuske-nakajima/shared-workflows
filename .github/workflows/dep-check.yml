@@ -118,21 +118,26 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
           echo "version=$(node -v)" >> "$GITHUB_OUTPUT"
 
-      # PM バージョンチェック。npm レジストリの最新版と実体を比較するのみ。
-      # npm view は npm/pnpm/bun と yarn classic(v1) はレジストリの該当系列を返す。
-      # yarn berry(v2+) は npm の yarn が classic 系列(1.x)を返し誤ったダウングレード提案に
-      # なるため比較対象から除外する（実体バージョンは Issue 本文用に出力する）。
-      # LATEST が空（レジストリ一時障害 / berry 除外）なら比較しない。
+      # PM バージョンチェック。実体と最新版を比較する。
+      # npm/pnpm/yarn classic(v1) は npm レジストリの最新版と比較する。
+      # yarn berry(v2+) は npm の yarn が classic 系列(1.x)を返すため比較対象から除外する
+      # （実体バージョンは Issue 本文用に出力する）。
+      # bun は npm レジストリではなく GitHub Releases (oven-sh/bun) が公式配布経路のため、
+      # そこから最新版を取得する。
+      # LATEST が空（取得失敗 / berry 除外）なら比較しない。
       - name: Check package manager version
         id: pm-check
         if: steps.detect.outputs.pm != 'none'
         env:
           PM: ${{ steps.detect.outputs.pm }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          ACTUAL=$("$PM" -v)
+          ACTUAL=$("$PM" --version)
           LATEST=""
           if [ "$PM" = yarn ] && [ "$(echo "$ACTUAL" | cut -d. -f1)" -ge 2 ]; then
             :
+          elif [ "$PM" = bun ]; then
+            LATEST=$(gh api repos/oven-sh/bun/releases/latest --jq '.tag_name' 2>/dev/null | sed 's/^bun-v//') || true
           else
             LATEST=$(npm view "$PM" version)
           fi
